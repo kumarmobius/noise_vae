@@ -1,0 +1,508 @@
+name: Variational Autoencoder with Noise Injection Builder V1
+description: Initialize a Variational Autoencoder (VAE) with noise injection. Encoder produces mu and log_var for reparameterization. Dynamic layer depth via comma-separated strings. Separate activation functions for encoder and decoder.
+
+inputs:
+  # Architecture
+  - {name: input_dim, type: Integer, description: "Input feature dimension", default: "128"}
+  - {name: latent_dim, type: Integer, description: "Latent space dimension (z)", default: "64"}
+  - {name: encoder_layers, type: String, description: "Comma-separated encoder hidden layer sizes e.g. 512,256,128", default: "512,256,128"}
+  - {name: decoder_layers, type: String, description: "Comma-separated decoder hidden layer sizes e.g. 128,256,512", default: "128,256,512"}
+
+  # Per-block activation functions
+  - {name: encoder_activation, type: String, description: "Encoder activation: relu, leaky_relu, elu, selu, gelu, tanh, sigmoid, swish, mish, prelu", default: "relu"}
+  - {name: decoder_activation, type: String, description: "Decoder activation: relu, leaky_relu, elu, selu, gelu, tanh, sigmoid, swish, mish, prelu", default: "relu"}
+
+  # Regularization
+  - {name: encoder_dropout, type: Float, description: "Encoder dropout rate (0.0 to disable)", default: "0.2"}
+  - {name: decoder_dropout, type: Float, description: "Decoder dropout rate (0.0 to disable)", default: "0.2"}
+  - {name: encoder_batch_norm, type: String, description: "Enable batch norm in encoder (true/false)", default: "true"}
+  - {name: decoder_batch_norm, type: String, description: "Enable batch norm in decoder (true/false)", default: "true"}
+
+  # Noise injection (applied to input before encoding)
+  - {name: noise_type, type: String, description: "Noise applied to input: gaussian, dropout, uniform, salt_pepper", default: "gaussian"}
+  - {name: noise_factor, type: Float, description: "Noise intensity: std scale for gaussian/uniform, mask prob for dropout/salt_pepper", default: "0.2"}
+
+  # VAE-specific
+  - {name: kl_weight, type: Float, description: "KL divergence loss weight (beta in beta-VAE). 1.0 = standard VAE", default: "1.0"}
+  - {name: recon_loss_type, type: String, description: "Reconstruction loss: mse, l1, smooth_l1, huber", default: "mse"}
+
+  # Optimizer
+  - {name: optimizer_type, type: String, description: "Optimizer: adam, adamw, sgd, rmsprop", default: "adam"}
+  - {name: learning_rate, type: Float, description: "Learning rate", default: "0.001"}
+  - {name: weight_decay, type: Float, description: "L2 weight decay", default: "0.0"}
+
+  # Reproducibility
+  - {name: seed, type: Integer, description: "Random seed", default: "42"}
+
+outputs:
+  - {name: initialized_model, type: Model, description: "Initialized VAE checkpoint (.pt) with full model_config saved inside"}
+
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import sys
+        import json
+        import random
+        import logging
+        import numpy as np
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("vae_builder")
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--input_dim",           type=int,   required=True)
+        parser.add_argument("--latent_dim",          type=int,   required=True)
+        parser.add_argument("--encoder_layers",      type=str,   required=True)
+        parser.add_argument("--decoder_layers",      type=str,   required=True)
+        parser.add_argument("--encoder_activation",  type=str,   required=True)
+        parser.add_argument("--decoder_activation",  type=str,   required=True)
+        parser.add_argument("--encoder_dropout",     type=float, required=True)
+        parser.add_argument("--decoder_dropout",     type=float, required=True)
+        parser.add_argument("--encoder_batch_norm",  type=str,   required=True)
+        parser.add_argument("--decoder_batch_norm",  type=str,   required=True)
+        parser.add_argument("--noise_type",          type=str,   required=True)
+        parser.add_argument("--noise_factor",        type=float, required=True)
+        parser.add_argument("--kl_weight",           type=float, required=True)
+        parser.add_argument("--recon_loss_type",     type=str,   required=True)
+        parser.add_argument("--optimizer_type",      type=str,   required=True)
+        parser.add_argument("--learning_rate",       type=float, required=True)
+        parser.add_argument("--weight_decay",        type=float, required=True)
+        parser.add_argument("--seed",                type=int,   required=True)
+        parser.add_argument("--initialized_model",   type=str,   required=True)
+        args = parser.parse_args()
+
+        # ============================================
+        # Helpers
+        # ============================================
+        def str_to_bool(s):
+            return str(s).lower() in ["true", "1", "yes"]
+
+        def parse_layers(s):
+            parsed = [int(x.strip()) for x in s.split(",") if x.strip()]
+            if not parsed:
+                raise ValueError(f"Could not parse layer sizes from: '{s}'")
+            return parsed
+
+        def set_seed(seed):
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            logger.info(f"✓ Seed set: {seed}")
+
+        def get_activation(name):
+            activations = {
+                "relu":       nn.ReLU(),
+                "leaky_relu": nn.LeakyReLU(0.2),
+                "elu":        nn.ELU(),
+                "selu":       nn.SELU(),
+                "gelu":       nn.GELU(),
+                "tanh":       nn.Tanh(),
+                "sigmoid":    nn.Sigmoid(),
+                "swish":      nn.SiLU(),
+                "mish":       nn.Mish(),
+                "prelu":      nn.PReLU(),
+            }
+            act = activations.get(name.lower())
+            if act is None:
+                raise ValueError(f"Unknown activation '{name}'. Valid: {list(activations.keys())}")
+            return act
+
+        VALID_NOISE_TYPES  = ["gaussian", "dropout", "uniform", "salt_pepper"]
+        VALID_LOSS_TYPES   = ["mse", "l1", "smooth_l1", "huber"]
+        VALID_ACTIVATIONS  = ["relu", "leaky_relu", "elu", "selu", "gelu",
+                              "tanh", "sigmoid", "swish", "mish", "prelu"]
+        VALID_OPTIMIZERS   = ["adam", "adamw", "sgd", "rmsprop"]
+
+        def validate_choice(val, valid_list, name):
+            if val.lower() not in valid_list:
+                raise ValueError(f"Invalid {name}='{val}'. Must be one of: {valid_list}")
+
+        # ============================================
+        # VAE Encoder
+        # Produces mu and log_var for reparameterization
+        # ============================================
+        class VAEEncoder(nn.Module):
+            def __init__(self, input_dim, encoder_dims, latent_dim,
+                         dropout, activation, use_batch_norm):
+                super(VAEEncoder, self).__init__()
+
+                layers   = []
+                prev_dim = input_dim
+
+                for idx, units in enumerate(encoder_dims):
+                    layers.append(nn.Linear(prev_dim, units))
+                    if use_batch_norm:
+                        layers.append(nn.BatchNorm1d(units))
+                    layers.append(get_activation(activation))
+                    if dropout > 0:
+                        layers.append(nn.Dropout(dropout))
+                    logger.info(f"    Encoder Layer {idx + 1}: {prev_dim} -> {units}  "
+                                f"[bn={use_batch_norm}, drop={dropout}, act={activation}]")
+                    prev_dim = units
+
+                self.shared = nn.Sequential(*layers)
+
+                # Two separate linear heads: mu and log_var
+                self.fc_mu      = nn.Linear(prev_dim, latent_dim)
+                self.fc_log_var = nn.Linear(prev_dim, latent_dim)
+
+                logger.info(f"    Encoder mu      : {prev_dim} -> {latent_dim}")
+                logger.info(f"    Encoder log_var : {prev_dim} -> {latent_dim}")
+
+            def forward(self, x):
+                h       = self.shared(x)
+                mu      = self.fc_mu(h)
+                log_var = self.fc_log_var(h)
+                return mu, log_var
+
+        # ============================================
+        # VAE Decoder
+        # Takes sampled z, reconstructs input
+        # ============================================
+        class VAEDecoder(nn.Module):
+            def __init__(self, latent_dim, decoder_dims, input_dim,
+                         dropout, activation, use_batch_norm):
+                super(VAEDecoder, self).__init__()
+
+                layers   = []
+                prev_dim = latent_dim
+
+                for idx, units in enumerate(decoder_dims):
+                    layers.append(nn.Linear(prev_dim, units))
+                    if use_batch_norm:
+                        layers.append(nn.BatchNorm1d(units))
+                    layers.append(get_activation(activation))
+                    if dropout > 0:
+                        layers.append(nn.Dropout(dropout))
+                    logger.info(f"    Decoder Layer {idx + 1}: {prev_dim} -> {units}  "
+                                f"[bn={use_batch_norm}, drop={dropout}, act={activation}]")
+                    prev_dim = units
+
+                # Final reconstruction — no activation (raw logits / continuous values)
+                layers.append(nn.Linear(prev_dim, input_dim))
+                logger.info(f"    Decoder Output  : {prev_dim} -> {input_dim}  [no activation]")
+
+                self.decoder = nn.Sequential(*layers)
+
+            def forward(self, z):
+                return self.decoder(z)
+
+        # ============================================
+        # Full NoisyVAE
+        # ============================================
+        class NoisyVAE(nn.Module):
+            def __init__(self, input_dim, encoder_dims, decoder_dims, latent_dim,
+                         encoder_dropout, decoder_dropout,
+                         encoder_activation, decoder_activation,
+                         encoder_batch_norm, decoder_batch_norm):
+                super(NoisyVAE, self).__init__()
+
+                self.input_dim  = input_dim
+                self.latent_dim = latent_dim
+
+                self.encoder = VAEEncoder(
+                    input_dim      = input_dim,
+                    encoder_dims   = encoder_dims,
+                    latent_dim     = latent_dim,
+                    dropout        = encoder_dropout,
+                    activation     = encoder_activation,
+                    use_batch_norm = encoder_batch_norm
+                )
+
+                self.decoder = VAEDecoder(
+                    latent_dim     = latent_dim,
+                    decoder_dims   = decoder_dims,
+                    input_dim      = input_dim,
+                    dropout        = decoder_dropout,
+                    activation     = decoder_activation,
+                    use_batch_norm = decoder_batch_norm
+                )
+
+            def reparameterize(self, mu, log_var):
+                if self.training:
+                    std = torch.exp(0.5 * log_var)
+                    eps = torch.randn_like(std)
+                    return mu + eps * std
+                return mu
+
+            def forward(self, x):
+                mu, log_var = self.encoder(x)
+                z           = self.reparameterize(mu, log_var)
+                recon       = self.decoder(z)
+                return recon, mu, log_var, z
+
+            def encode(self, x):
+                mu, log_var = self.encoder(x)
+                z = self.reparameterize(mu, log_var)
+                return z, mu, log_var
+
+            def decode(self, z):
+                return self.decoder(z)
+
+            def sample(self, n_samples, device):
+                z = torch.randn(n_samples, self.latent_dim, device=device)
+                return self.decoder(z)
+
+        def get_optimizer(model, optimizer_type, lr, weight_decay):
+            optimizers = {
+                "adam":    optim.Adam(model.parameters(),   lr=lr, weight_decay=weight_decay),
+                "adamw":   optim.AdamW(model.parameters(),  lr=lr, weight_decay=weight_decay),
+                "sgd":     optim.SGD(model.parameters(),    lr=lr, weight_decay=weight_decay, momentum=0.9, nesterov=True),
+                "rmsprop": optim.RMSprop(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9),
+            }
+            return optimizers[optimizer_type.lower()]
+
+        # ============================================
+        # Main
+        # ============================================
+        try:
+            set_seed(args.seed)
+
+            logger.info("=" * 60)
+            logger.info("Validating Inputs")
+            logger.info("=" * 60)
+
+            validate_choice(args.noise_type,         VALID_NOISE_TYPES, "noise_type")
+            validate_choice(args.recon_loss_type,    VALID_LOSS_TYPES,  "recon_loss_type")
+            validate_choice(args.encoder_activation, VALID_ACTIVATIONS, "encoder_activation")
+            validate_choice(args.decoder_activation, VALID_ACTIVATIONS, "decoder_activation")
+            validate_choice(args.optimizer_type,     VALID_OPTIMIZERS,  "optimizer_type")
+
+            if args.input_dim <= 0:
+                raise ValueError(f"input_dim must be > 0, got {args.input_dim}")
+            if args.latent_dim <= 0:
+                raise ValueError(f"latent_dim must be > 0, got {args.latent_dim}")
+            if not (0.0 <= args.encoder_dropout < 1.0):
+                raise ValueError(f"encoder_dropout must be in [0, 1), got {args.encoder_dropout}")
+            if not (0.0 <= args.decoder_dropout < 1.0):
+                raise ValueError(f"decoder_dropout must be in [0, 1), got {args.decoder_dropout}")
+            if not (0.0 <= args.noise_factor <= 1.0):
+                raise ValueError(f"noise_factor must be in [0, 1], got {args.noise_factor}")
+            if args.kl_weight < 0:
+                raise ValueError(f"kl_weight must be >= 0, got {args.kl_weight}")
+
+            encoder_dims       = parse_layers(args.encoder_layers)
+            decoder_dims       = parse_layers(args.decoder_layers)
+            encoder_batch_norm = str_to_bool(args.encoder_batch_norm)
+            decoder_batch_norm = str_to_bool(args.decoder_batch_norm)
+
+            logger.info(f"✓ input_dim          : {args.input_dim}")
+            logger.info(f"✓ latent_dim         : {args.latent_dim}")
+            logger.info(f"✓ encoder_layers     : {encoder_dims}")
+            logger.info(f"✓ decoder_layers     : {decoder_dims}")
+            logger.info(f"✓ encoder_activation : {args.encoder_activation}")
+            logger.info(f"✓ decoder_activation : {args.decoder_activation}")
+            logger.info(f"✓ encoder_dropout    : {args.encoder_dropout}")
+            logger.info(f"✓ decoder_dropout    : {args.decoder_dropout}")
+            logger.info(f"✓ encoder_batch_norm : {encoder_batch_norm}")
+            logger.info(f"✓ decoder_batch_norm : {decoder_batch_norm}")
+            logger.info(f"✓ noise_type         : {args.noise_type}")
+            logger.info(f"✓ noise_factor       : {args.noise_factor}")
+            logger.info(f"✓ kl_weight          : {args.kl_weight}")
+            logger.info(f"✓ recon_loss_type    : {args.recon_loss_type}")
+            logger.info(f"✓ optimizer_type     : {args.optimizer_type}")
+            logger.info(f"✓ learning_rate      : {args.learning_rate}")
+            logger.info(f"✓ weight_decay       : {args.weight_decay}")
+
+            # ============================================
+            # Build Model
+            # ============================================
+            logger.info("=" * 60)
+            logger.info("Building NoisyVAE")
+            logger.info("=" * 60)
+
+            model = NoisyVAE(
+                input_dim          = args.input_dim,
+                encoder_dims       = encoder_dims,
+                decoder_dims       = decoder_dims,
+                latent_dim         = args.latent_dim,
+                encoder_dropout    = args.encoder_dropout,
+                decoder_dropout    = args.decoder_dropout,
+                encoder_activation = args.encoder_activation,
+                decoder_activation = args.decoder_activation,
+                encoder_batch_norm = encoder_batch_norm,
+                decoder_batch_norm = decoder_batch_norm
+            )
+
+            total_params     = sum(p.numel() for p in model.parameters())
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info(f"✓ Model built")
+            logger.info(f"  Total parameters     : {total_params:,}")
+            logger.info(f"  Trainable parameters : {trainable_params:,}")
+
+            # ============================================
+            # Sanity check — forward pass with dummy input
+            # ============================================
+            logger.info("=" * 60)
+            logger.info("Running Sanity Check (forward pass)")
+            logger.info("=" * 60)
+
+            model.train()
+            dummy  = torch.randn(4, args.input_dim)
+            recon, mu, log_var, z = model(dummy)
+
+            assert recon.shape    == (4, args.input_dim), f"recon shape mismatch: {recon.shape}"
+            assert mu.shape       == (4, args.latent_dim), f"mu shape mismatch: {mu.shape}"
+            assert log_var.shape  == (4, args.latent_dim), f"log_var shape mismatch: {log_var.shape}"
+            assert z.shape        == (4, args.latent_dim), f"z shape mismatch: {z.shape}"
+
+            logger.info(f"✓ Forward pass OK")
+            logger.info(f"  Input shape    : {dummy.shape}")
+            logger.info(f"  Recon shape    : {recon.shape}")
+            logger.info(f"  mu shape       : {mu.shape}")
+            logger.info(f"  log_var shape  : {log_var.shape}")
+            logger.info(f"  z shape        : {z.shape}")
+
+            # Sampling check
+            model.eval()
+            sample = model.sample(4, device=torch.device("cpu"))
+            assert sample.shape == (4, args.input_dim), f"sample shape mismatch: {sample.shape}"
+            logger.info(f"✓ Sampling check OK: {sample.shape}")
+
+            # ============================================
+            # Optimizer
+            # ============================================
+            optimizer = get_optimizer(model, args.optimizer_type,
+                                      args.learning_rate, args.weight_decay)
+            logger.info(f"✓ Optimizer built: {args.optimizer_type}")
+
+            # ============================================
+            # Build model_config
+            # Stored inside checkpoint so every downstream
+            # YAML (train, evaluate, inference) can
+            # reconstruct the model without any other file
+            # ============================================
+            model_config = {
+                "input_dim":  args.input_dim,
+                "latent_dim": args.latent_dim,
+                "encoder": {
+                    "layer_sizes": encoder_dims,
+                    "activation":  args.encoder_activation,
+                    "dropout":     args.encoder_dropout,
+                    "batch_norm":  encoder_batch_norm,
+                },
+                "decoder": {
+                    "layer_sizes": decoder_dims,
+                    "activation":  args.decoder_activation,
+                    "dropout":     args.decoder_dropout,
+                    "batch_norm":  decoder_batch_norm,
+                },
+                "noise": {
+                    "noise_type":   args.noise_type,
+                    "noise_factor": args.noise_factor,
+                },
+                "vae": {
+                    "kl_weight":       args.kl_weight,
+                    "recon_loss_type": args.recon_loss_type,
+                }
+            }
+
+            optimizer_config = {
+                "type":         args.optimizer_type,
+                "lr":           args.learning_rate,
+                "weight_decay": args.weight_decay,
+            }
+
+            # ============================================
+            # Save Checkpoint
+            # ============================================
+            logger.info("=" * 60)
+            logger.info("Saving Initialized Model")
+            logger.info("=" * 60)
+
+            os.makedirs(args.initialized_model, exist_ok=True)
+            checkpoint_path = os.path.join(args.initialized_model, "initialized_vae_model.pt")
+
+            torch.save({
+                "model_state_dict":     model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "model_config":         model_config,
+                "optimizer_config":     optimizer_config,
+            }, checkpoint_path)
+
+            logger.info(f"✓ Checkpoint saved: {checkpoint_path}")
+
+            # Human-readable config summary
+            config_summary_path = os.path.join(args.initialized_model, "model_config.json")
+            with open(config_summary_path, "w") as f:
+                json.dump({
+                    "model_config":     model_config,
+                    "optimizer_config": optimizer_config,
+                    "total_params":     total_params,
+                    "trainable_params": trainable_params,
+                }, f, indent=2)
+            logger.info(f"✓ Config summary saved: {config_summary_path}")
+
+            logger.info("=" * 60)
+            logger.info("✓ NoisyVAE Builder Complete!")
+            logger.info("=" * 60)
+            logger.info(f"  input_dim          : {args.input_dim}")
+            logger.info(f"  latent_dim         : {args.latent_dim}")
+            logger.info(f"  encoder_layers     : {encoder_dims}")
+            logger.info(f"  decoder_layers     : {decoder_dims}")
+            logger.info(f"  encoder_activation : {args.encoder_activation}")
+            logger.info(f"  decoder_activation : {args.decoder_activation}")
+            logger.info(f"  noise_type         : {args.noise_type}")
+            logger.info(f"  noise_factor       : {args.noise_factor}")
+            logger.info(f"  kl_weight          : {args.kl_weight}")
+            logger.info(f"  recon_loss_type    : {args.recon_loss_type}")
+            logger.info(f"  Total parameters   : {total_params:,}")
+            logger.info(f"  Checkpoint         : {checkpoint_path}")
+
+        except Exception as e:
+            logger.exception(f"Fatal error during model building: {str(e)}")
+            sys.exit(1)
+
+    args:
+      - --input_dim
+      - {inputValue: input_dim}
+      - --latent_dim
+      - {inputValue: latent_dim}
+      - --encoder_layers
+      - {inputValue: encoder_layers}
+      - --decoder_layers
+      - {inputValue: decoder_layers}
+      - --encoder_activation
+      - {inputValue: encoder_activation}
+      - --decoder_activation
+      - {inputValue: decoder_activation}
+      - --encoder_dropout
+      - {inputValue: encoder_dropout}
+      - --decoder_dropout
+      - {inputValue: decoder_dropout}
+      - --encoder_batch_norm
+      - {inputValue: encoder_batch_norm}
+      - --decoder_batch_norm
+      - {inputValue: decoder_batch_norm}
+      - --noise_type
+      - {inputValue: noise_type}
+      - --noise_factor
+      - {inputValue: noise_factor}
+      - --kl_weight
+      - {inputValue: kl_weight}
+      - --recon_loss_type
+      - {inputValue: recon_loss_type}
+      - --optimizer_type
+      - {inputValue: optimizer_type}
+      - --learning_rate
+      - {inputValue: learning_rate}
+      - --weight_decay
+      - {inputValue: weight_decay}
+      - --seed
+      - {inputValue: seed}
+      - --initialized_model
+      - {outputPath: initialized_model}
