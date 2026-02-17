@@ -1,4 +1,4 @@
-name: Variational Autoencoder with Noise Injection Builder V1
+name: Variational Autoencoder with Noise Injection Builder V2
 description: Initialize a Variational Autoencoder (VAE) with noise injection. Encoder produces mu and log_var for reparameterization. Dynamic layer depth via comma-separated strings. Separate activation functions for encoder and decoder.
 
 inputs:
@@ -36,6 +36,7 @@ inputs:
 
 outputs:
   - {name: initialized_model, type: Model, description: "Initialized VAE checkpoint (.pt) with full model_config saved inside"}
+  - {name: model_config_file, type: Data, description: "Human-readable JSON config file containing model architecture, optimizer settings, and parameter counts"}
 
 implementation:
   container:
@@ -79,6 +80,7 @@ implementation:
         parser.add_argument("--weight_decay",        type=float, required=True)
         parser.add_argument("--seed",                type=int,   required=True)
         parser.add_argument("--initialized_model",   type=str,   required=True)
+        parser.add_argument("--model_config_file",   type=str,   required=True)
         args = parser.parse_args()
 
         # ============================================
@@ -436,16 +438,26 @@ implementation:
 
             logger.info(f"✓ Checkpoint saved: {checkpoint_path}")
 
-            # Human-readable config summary
+            # Human-readable config summary payload
+            config_summary_payload = {
+                "model_config":     model_config,
+                "optimizer_config": optimizer_config,
+                "total_params":     total_params,
+                "trainable_params": trainable_params,
+            }
+            
+            # Save embedded copy alongside the checkpoint
             config_summary_path = os.path.join(args.initialized_model, "model_config.json")
             with open(config_summary_path, "w") as f:
-                json.dump({
-                    "model_config":     model_config,
-                    "optimizer_config": optimizer_config,
-                    "total_params":     total_params,
-                    "trainable_params": trainable_params,
-                }, f, indent=2)
-            logger.info(f"✓ Config summary saved: {config_summary_path}")
+                json.dump(config_summary_payload, f, indent=2)
+            logger.info(f"✓ Config summary saved (embedded): {config_summary_path}")
+            
+            # Save to dedicated model_config_file output path
+            os.makedirs(args.model_config_file, exist_ok=True)
+            model_config_file_path = os.path.join(args.model_config_file, "model_config.json")
+            with open(model_config_file_path, "w") as f:
+                json.dump(config_summary_payload, f, indent=2)
+            logger.info(f"✓ Config summary saved (output):   {model_config_file_path}")
 
             logger.info("=" * 60)
             logger.info("✓ NoisyVAE Builder Complete!")
@@ -506,3 +518,5 @@ implementation:
       - {inputValue: seed}
       - --initialized_model
       - {outputPath: initialized_model}
+      - --model_config_file
+      - {outputPath: model_config_file}
