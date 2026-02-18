@@ -1,4 +1,4 @@
-name: Variational Autoencoder with Noise Injection Evaluator V1
+name: Variational Autoencoder with Noise Injection Evaluator V1.1
 description: Evaluate NoisyVAE on test set. Reports ELBO, reconstruction loss, KL divergence, R2, MAE, MSE, cosine similarity, SNR, and latent space statistics. Reads model_config directly from trained checkpoint.
 
 inputs:
@@ -589,13 +589,7 @@ implementation:
                 "recon_loss":      float(avg_recon_loss),
                 "kl_loss":         float(avg_kl_loss),
                 "mse":             float(recon_metrics["mse"]),
-                "rmse":            float(recon_metrics["rmse"]),
-                "mae":             float(recon_metrics["mae"]),
-                "r2_score":        float(recon_metrics["r2_score"]),
-                "cosine_sim":      float(recon_metrics["cosine_similarity_mean"]),
-                "snr_db":          float(recon_metrics["snr_db"]),
                 "active_dims":     int(latent_stats["active_dims"]),
-                "active_dims_ratio": float(latent_stats["active_dims_ratio"]),
             }
             with open(args.schema_json, "w") as f:
                 json.dump(schema_data, f, indent=2)
